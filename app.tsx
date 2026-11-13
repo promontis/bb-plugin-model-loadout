@@ -1,0 +1,793 @@
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+  type DragEvent,
+} from "react";
+import {
+  definePluginApp,
+  experimental_ProviderIcon as ProviderIcon,
+  experimental_useProviders as useProviders,
+  useBbContext,
+  useComposer,
+  useRealtime,
+  useRpc,
+  useSdk,
+  experimental_useSidebarThreads as useSidebarThreads,
+} from "@get-bb/plugin-sdk/app";
+import type { LoadoutConfig, LoadoutItem, rpcContract } from "./server";
+import { Icon } from "@/components/ui/icon";
+import { Input } from "@/components/ui/input";
+import { cn } from "@/lib/utils";
+
+type Sdk = ReturnType<typeof useSdk>;
+type ModelsResult = Awaited<ReturnType<Sdk["providers"]["models"]>>;
+type AvailableModel = ModelsResult["models"][number];
+type ProviderState = ReturnType<typeof useProviders>;
+type Provider = ProviderState["providers"][number];
+type Catalog = {
+  models: readonly AvailableModel[];
+  error: string | null;
+  loading: boolean;
+};
+type ReasoningLevel = LoadoutItem["reasoningLevel"];
+
+const MAX_LOADOUT = 5;
+const DRAG_TYPE = "application/x-bb-model-loadout";
+const LOADOUT_CHANGED = "loadout-changed";
+
+function itemKey(item: Pick<LoadoutItem, "providerId" | "model">): string {
+  return `${item.providerId}\0${item.model}`;
+}
+
+function displayEffort(value: string): string {
+  if (value === "xhigh") return "Extra High";
+  return value.slice(0, 1).toUpperCase() + value.slice(1);
+}
+
+function useLoadout() {
+  const rpc = useRpc<typeof rpcContract>();
+  const [config, setConfig] = useState<LoadoutConfig | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const refresh = useCallback(() => {
+    rpc.call("loadout_get").then(
+      (next) => {
+        setConfig(next);
+        setError(null);
+      },
+      (cause) => setError(cause instanceof Error ? cause.message : String(cause)),
+    );
+  }, [rpc]);
+
+  useEffect(refresh, [refresh]);
+  useRealtime(LOADOUT_CHANGED, refresh);
+
+  const save = useCallback(
+    async (next: LoadoutConfig) => {
+      setConfig(next);
+      try {
+        const saved = await rpc.call("loadout_save", next);
+        setConfig(saved);
+        setError(null);
+        return saved;
+      } catch (cause) {
+        setError(cause instanceof Error ? cause.message : String(cause));
+        refresh();
+        throw cause;
+      }
+    },
+    [refresh, rpc],
+  );
+
+  return { config, error, save };
+}
+
+function useEnvironmentId(): string | null {
+  const { threadId } = useBbContext();
+  const { threads } = useSidebarThreads();
+  return (
+    threads.find((thread) => thread.id === threadId)?.environment?.id ?? null
+  );
+}
+
+function useCatalogs(providers: readonly Provider[]) {
+  const sdk = useSdk();
+  const environmentId = useEnvironmentId();
+  const providerIds = useMemo(
+    () => providers.filter((provider) => provider.available).map((provider) => provider.id),
+    [providers],
+  );
+  const providerKey = providerIds.join("\0");
+  const [catalogs, setCatalogs] = useState<Record<string, Catalog>>({});
+
+  useEffect(() => {
+    const controller = new AbortController();
+    setCatalogs(
+      Object.fromEntries(
+        providerIds.map((providerId) => [
+          providerId,
+          { models: [], error: null, loading: true },
+        ]),
+      ),
+    );
+    for (const providerId of providerIds) {
+      const request =
+        environmentId === null
+          ? { providerId, preferCached: true, signal: controller.signal }
+          : {
+              providerId,
+              preferCached: true,
+              signal: controller.signal,
+              environmentId,
+            };
+      sdk.providers
+        .models(request)
+        .then(
+          (result) => {
+            if (controller.signal.aborted) return;
+            setCatalogs((current) => ({
+              ...current,
+              [providerId]: {
+                models: [...result.models, ...result.selectedOnlyModels],
+                error: result.modelLoadError?.detail ?? null,
+                loading: false,
+              },
+            }));
+          },
+          (cause) => {
+            if (controller.signal.aborted) return;
+            setCatalogs((current) => ({
+              ...current,
+              [providerId]: {
+                models: [],
+                error: cause instanceof Error ? cause.message : String(cause),
+                loading: false,
+              },
+            }));
+          },
+        );
+    }
+    return () => controller.abort();
+  }, [environmentId, providerKey, sdk]);
+
+  return catalogs;
+}
+
+function recommendedItems(
+  providers: readonly Provider[],
+  catalogs: Readonly<Record<string, Catalog>>,
+): LoadoutItem[] {
+  const items: LoadoutItem[] = [];
+  for (const provider of providers) {
+    const catalog = catalogs[provider.id];
+    if (catalog?.loading !== false) continue;
+    const model = catalog.models.find((candidate) => candidate.isDefault) ?? catalog.models[0];
+    if (model === undefined) continue;
+    items.push({
+      providerId: provider.id,
+      model: model.model,
+      reasoningLevel: model.defaultReasoningEffort as ReasoningLevel,
+      ...(model.supportedServiceTiers?.some((tier) => tier.id === "default")
+        ? { serviceTier: "default" }
+        : {}),
+    });
+    if (items.length === MAX_LOADOUT) break;
+  }
+  return items;
+}
+
+function useModelLoadout() {
+  const providerState = useProviders();
+  const providers = providerState.providers;
+  const catalogs = useCatalogs(providers);
+  const loadout = useLoadout();
+
+  useEffect(() => {
+    if (loadout.config === null || loadout.config.initialized) return;
+    if (providers.length === 0) return;
+    if (providers.some((provider) => catalogs[provider.id]?.loading !== false)) return;
+    void loadout.save({
+      version: 1,
+      initialized: true,
+      items: recommendedItems(providers, catalogs),
+    });
+  }, [catalogs, loadout.config, loadout.save, providers]);
+
+  return { ...loadout, providers, catalogs, providerStatus: providerState.status };
+}
+
+function findModel(
+  item: Pick<LoadoutItem, "providerId" | "model">,
+  catalogs: Readonly<Record<string, Catalog>>,
+): AvailableModel | undefined {
+  return catalogs[item.providerId]?.models.find((model) => model.model === item.model);
+}
+
+function findProvider(providerId: string, providers: readonly Provider[]) {
+  return providers.find((provider) => provider.id === providerId);
+}
+
+function ModelMark({ provider, className }: { provider: Provider | undefined; className?: string }) {
+  return provider === undefined ? (
+    <Icon name="Bot" className={className} aria-hidden />
+  ) : (
+    <ProviderIcon
+      providerKind="agent"
+      provider={provider}
+      fallback="Bot"
+      className={className}
+      aria-hidden
+    />
+  );
+}
+
+function SelectorAction() {
+  const composer = useComposer();
+  const selection = composer.selection;
+  const { config, providers, catalogs } = useModelLoadout();
+  if (selection?.providerId === undefined || selection.model === undefined) return null;
+  const item =
+    config?.items.find(
+      (candidate) =>
+        candidate.providerId === selection.providerId && candidate.model === selection.model,
+    ) ?? { providerId: selection.providerId, model: selection.model };
+  const model = findModel(item, catalogs);
+  const provider = findProvider(selection.providerId, providers);
+  return (
+    <button
+      type="button"
+      data-model-loadout-trigger=""
+      onClick={() => composer.experimental_openPopup("model-selector")}
+      className="flex h-7 max-w-56 items-center gap-1.5 rounded-md px-2 text-sm text-muted-foreground transition-colors hover:bg-state-hover hover:text-foreground"
+      aria-label="Choose agent and model"
+      title="Choose agent and model"
+    >
+      <ModelMark provider={provider} className="size-4 shrink-0" />
+      <span className="min-w-0 truncate text-foreground">
+        {model?.displayName ?? selection.model}
+      </span>
+      {selection.reasoningLevel === undefined ? null : (
+        <span className="shrink-0 text-subtle-foreground">
+          {displayEffort(selection.reasoningLevel)}
+        </span>
+      )}
+      <Icon name="ChevronDown" className="size-3.5 shrink-0" aria-hidden />
+    </button>
+  );
+}
+
+function ModelSelectorPopup() {
+  const composer = useComposer();
+  const { config, error, save, providers, catalogs } = useModelLoadout();
+  const [query, setQuery] = useState("");
+  const [pending, setPending] = useState(false);
+  const selection = composer.selection;
+  const items = config?.items ?? [];
+  const filtered = items.filter((item) => {
+    const model = findModel(item, catalogs);
+    const provider = findProvider(item.providerId, providers);
+    const haystack = `${model?.displayName ?? item.model} ${provider?.displayName ?? item.providerId}`;
+    return haystack.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase());
+  });
+  const currentItem = items.find(
+    (item) =>
+      item.providerId === selection?.providerId && item.model === selection?.model,
+  );
+  const currentModel =
+    currentItem === undefined ? undefined : findModel(currentItem, catalogs);
+
+  const choose = async (item: LoadoutItem) => {
+    if (pending) return;
+    setPending(true);
+    try {
+      await composer.setSelection({
+        providerId: item.providerId,
+        model: item.model,
+        reasoningLevel: item.reasoningLevel,
+        ...(item.serviceTier === undefined ? {} : { serviceTier: item.serviceTier }),
+      });
+      composer.experimental_closePopup();
+    } finally {
+      setPending(false);
+    }
+  };
+
+  const setEffort = async (reasoningLevel: LoadoutItem["reasoningLevel"]) => {
+    if (currentItem === undefined || config === null) return;
+    await composer.setSelection({ reasoningLevel });
+    await save({
+      ...config,
+      items: config.items.map((item) =>
+        itemKey(item) === itemKey(currentItem) ? { ...item, reasoningLevel } : item,
+      ),
+    });
+  };
+
+  const fastTier = currentModel?.supportedServiceTiers?.find((tier) => tier.id === "fast");
+  const fast = selection?.serviceTier === "fast";
+
+  return (
+    <div
+      data-model-loadout-popup=""
+      className="w-[min(34rem,calc(100vw-1rem))] overflow-hidden rounded-xl border border-border bg-popover text-popover-foreground shadow-xl"
+    >
+      <div className="border-b border-border px-2 py-2">
+        <div className="relative">
+          <Icon name="Search" className="absolute left-2 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" aria-hidden />
+          <Input
+            autoFocus
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            placeholder="Search models"
+            aria-label="Search loadout models"
+            className="h-9 border-0 bg-transparent pl-8 shadow-none focus-visible:ring-0"
+          />
+        </div>
+      </div>
+
+      <div className="max-h-[22rem] overflow-y-auto p-2">
+        {error !== null ? <p className="px-2 py-2 text-xs text-destructive">{error}</p> : null}
+        {config === null ? (
+          <p className="px-2 py-3 text-sm text-muted-foreground">Loading models…</p>
+        ) : filtered.length === 0 ? (
+          <p className="px-2 py-3 text-sm text-muted-foreground">
+            {items.length === 0 ? "Your model loadout is empty." : "No matching models."}
+          </p>
+        ) : (
+          filtered.map((item) => {
+            const model = findModel(item, catalogs);
+            const provider = findProvider(item.providerId, providers);
+            const selected =
+              selection?.providerId === item.providerId && selection.model === item.model;
+            return (
+              <button
+                key={itemKey(item)}
+                type="button"
+                disabled={pending || model === undefined}
+                onClick={() => void choose(item)}
+                className={cn(
+                  "flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left transition-colors",
+                  selected ? "bg-state-selected text-foreground" : "hover:bg-state-hover",
+                  model === undefined && "opacity-50",
+                )}
+              >
+                <Icon name="DragDropVertical" className="size-4 shrink-0 text-subtle-foreground" aria-hidden />
+                <ModelMark provider={provider} className="size-5 shrink-0" />
+                <span className="min-w-0 flex-1 truncate text-sm font-medium">
+                  {model?.displayName ?? item.model}
+                </span>
+                <span className="shrink-0 text-sm text-muted-foreground">
+                  {displayEffort(item.reasoningLevel)}
+                </span>
+                {selected ? <Icon name="Check" className="size-4 shrink-0" aria-hidden /> : null}
+              </button>
+            );
+          })
+        )}
+      </div>
+
+      {currentModel === undefined ? null : (
+        <div className="space-y-2 border-t border-border px-3 py-2.5">
+          <div className="flex items-center gap-2">
+            <span className="flex-1 text-sm font-medium">Effort</span>
+            <div className="flex flex-wrap justify-end gap-1">
+              {currentModel.supportedReasoningEfforts.map((effort) => (
+                <button
+                  key={effort.reasoningEffort}
+                  type="button"
+                  data-model-loadout-effort={effort.reasoningEffort}
+                  onClick={() => void setEffort(effort.reasoningEffort as ReasoningLevel)}
+                  className={cn(
+                    "rounded-md px-2 py-1 text-xs transition-colors",
+                    selection?.reasoningLevel === effort.reasoningEffort
+                      ? "bg-state-selected text-foreground"
+                      : "text-muted-foreground hover:bg-state-hover hover:text-foreground",
+                  )}
+                >
+                  {displayEffort(effort.reasoningEffort)}
+                </button>
+              ))}
+            </div>
+          </div>
+          {fastTier === undefined ? null : (
+            <div className="flex items-center justify-between">
+              <span className="text-sm font-medium">Fast</span>
+              <button
+                type="button"
+                role="switch"
+                data-model-loadout-fast=""
+                aria-checked={fast}
+                onClick={() => void composer.setSelection({ serviceTier: fast ? "default" : "fast" })}
+                className={cn(
+                  "relative h-6 w-11 rounded-full transition-colors",
+                  fast ? "bg-primary" : "bg-muted",
+                )}
+              >
+                <span
+                  className={cn(
+                    "absolute top-1 size-4 rounded-full bg-background shadow-sm transition-transform",
+                    fast ? "translate-x-5" : "translate-x-1",
+                  )}
+                />
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+
+      <div className="flex items-center justify-between border-t border-border px-3 py-2">
+        <a
+          href="/settings/plugins/model-loadout"
+          className="inline-flex items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground"
+        >
+          <Icon name="Settings" className="size-4" aria-hidden />
+          Edit loadout
+        </a>
+        <span className="text-xs text-subtle-foreground">{items.length}/{MAX_LOADOUT} models</span>
+      </div>
+    </div>
+  );
+}
+
+function LoadoutCard({
+  item,
+  index,
+  providers,
+  catalogs,
+  onRemove,
+  onEffort,
+  onDrop,
+}: {
+  item: LoadoutItem;
+  index: number;
+  providers: readonly Provider[];
+  catalogs: Readonly<Record<string, Catalog>>;
+  onRemove(): void;
+  onEffort(reasoningLevel: LoadoutItem["reasoningLevel"]): void;
+  onDrop(event: DragEvent, index: number): void;
+}) {
+  const provider = findProvider(item.providerId, providers);
+  const model = findModel(item, catalogs);
+  return (
+    <div
+      draggable
+      onDragStart={(event) => event.dataTransfer.setData(DRAG_TYPE, JSON.stringify(item))}
+      onDragOver={(event) => event.preventDefault()}
+      onDrop={(event) => onDrop(event, index)}
+      className="group relative flex min-h-36 min-w-40 flex-col border-r border-border p-4 last:border-r-0"
+    >
+      {index === 0 ? (
+        <span className="absolute right-3 top-3 rounded border border-border px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-wide text-muted-foreground">
+          Default
+        </span>
+      ) : null}
+      <ModelMark provider={provider} className="size-8" />
+      <div className="mt-auto min-w-0 pt-4">
+        <div className="truncate font-mono text-sm font-medium">
+          {model?.displayName ?? item.model}
+        </div>
+        {model === undefined ? (
+          <p className="mt-1 text-xs text-destructive">Unavailable</p>
+        ) : (
+          <select
+            value={item.reasoningLevel}
+            onChange={(event) =>
+              onEffort(event.target.value as LoadoutItem["reasoningLevel"])
+            }
+            className="mt-1 max-w-full bg-transparent text-sm text-muted-foreground outline-none"
+            aria-label={`Effort for ${model.displayName}`}
+          >
+            {model.supportedReasoningEfforts.map((effort) => (
+              <option key={effort.reasoningEffort} value={effort.reasoningEffort}>
+                {displayEffort(effort.reasoningEffort)}
+              </option>
+            ))}
+          </select>
+        )}
+      </div>
+      <button
+        type="button"
+        onClick={onRemove}
+        className="absolute right-2 bottom-2 rounded p-1 text-subtle-foreground opacity-0 transition-opacity hover:bg-state-hover hover:text-foreground group-hover:opacity-100 focus:opacity-100"
+        aria-label={`Remove ${model?.displayName ?? item.model} from loadout`}
+      >
+        <Icon name="Cancel01" className="size-3.5" aria-hidden />
+      </button>
+    </div>
+  );
+}
+
+function EmptyLoadoutSlot({ index, onDrop }: { index: number; onDrop(event: DragEvent, index: number): void }) {
+  return (
+    <div
+      onDragOver={(event) => event.preventDefault()}
+      onDrop={(event) => onDrop(event, index)}
+      className="flex min-h-36 min-w-40 items-center justify-center border-r border-dashed border-border p-4 last:border-r-0"
+    >
+      <span className="font-mono text-[10px] uppercase tracking-wider text-subtle-foreground">
+        Drop model here
+      </span>
+    </div>
+  );
+}
+
+function DefaultModelsSettings() {
+  const { config, error, save, providers, catalogs, providerStatus } = useModelLoadout();
+  const [query, setQuery] = useState("");
+  const [dragging, setDragging] = useState(false);
+  const items = config?.items ?? [];
+  const selected = useMemo(() => new Set(items.map(itemKey)), [items]);
+
+  const commitItems = (nextItems: LoadoutItem[]) => {
+    if (config === null) return;
+    void save({ ...config, initialized: true, items: nextItems.slice(0, MAX_LOADOUT) });
+  };
+
+  const add = (providerId: string, model: AvailableModel, at = items.length) => {
+    const candidate: LoadoutItem = {
+      providerId,
+      model: model.model,
+      reasoningLevel: model.defaultReasoningEffort as ReasoningLevel,
+      ...(model.supportedServiceTiers?.some((tier) => tier.id === "default")
+        ? { serviceTier: "default" }
+        : {}),
+    };
+    const without = items.filter((item) => itemKey(item) !== itemKey(candidate));
+    without.splice(Math.min(at, without.length), 0, candidate);
+    commitItems(without);
+  };
+
+  const handleDrop = (event: DragEvent, index: number) => {
+    event.preventDefault();
+    setDragging(false);
+    try {
+      const dropped = JSON.parse(event.dataTransfer.getData(DRAG_TYPE)) as Partial<LoadoutItem>;
+      if (typeof dropped.providerId !== "string" || typeof dropped.model !== "string") return;
+      const existing = items.find(
+        (item) => item.providerId === dropped.providerId && item.model === dropped.model,
+      );
+      if (existing !== undefined) {
+        const next = items.filter((item) => itemKey(item) !== itemKey(existing));
+        next.splice(Math.min(index, next.length), 0, existing);
+        commitItems(next);
+        return;
+      }
+      const model = catalogs[dropped.providerId]?.models.find(
+        (candidate) => candidate.model === dropped.model,
+      );
+      if (model !== undefined) add(dropped.providerId, model, index);
+    } catch {
+      // Ignore drags that did not originate from this settings section.
+    }
+  };
+
+  return (
+    <div className="space-y-8 pb-6">
+      <div>
+        <h2 className="text-xl font-semibold tracking-tight">Default models</h2>
+        <p className="mt-1 text-sm text-muted-foreground">
+          Choose and order the models shown in your composer selector.
+        </p>
+      </div>
+
+      <section className="space-y-3">
+        <div>
+          <h3 className="text-sm font-medium">Loadout</h3>
+          <p className="mt-1 text-sm text-muted-foreground">
+            The first model is your default preset. Drag models to reorder them.
+          </p>
+        </div>
+        <div
+          className={cn(
+            "grid overflow-x-auto rounded-lg border border-border bg-card",
+            "grid-flow-col auto-cols-[minmax(10rem,1fr)]",
+            dragging && "ring-1 ring-ring",
+          )}
+          onDragEnter={() => setDragging(true)}
+          onDragLeave={(event) => {
+            if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDragging(false);
+          }}
+        >
+          {items.map((item, index) => (
+            <LoadoutCard
+              key={itemKey(item)}
+              item={item}
+              index={index}
+              providers={providers}
+              catalogs={catalogs}
+              onRemove={() => commitItems(items.filter((candidate) => itemKey(candidate) !== itemKey(item)))}
+              onEffort={(reasoningLevel) =>
+                commitItems(
+                  items.map((candidate) =>
+                    itemKey(candidate) === itemKey(item)
+                      ? { ...candidate, reasoningLevel }
+                      : candidate,
+                  ),
+                )
+              }
+              onDrop={handleDrop}
+            />
+          ))}
+          {Array.from({ length: MAX_LOADOUT - items.length }, (_, offset) => (
+            <EmptyLoadoutSlot key={`empty-${offset}`} index={items.length + offset} onDrop={handleDrop} />
+          ))}
+        </div>
+        {error === null ? null : <p className="text-sm text-destructive">{error}</p>}
+      </section>
+
+      <section className="space-y-3">
+        <div className="relative max-w-sm">
+          <Icon name="Search" className="absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" aria-hidden />
+          <Input
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            placeholder="Search available models"
+            aria-label="Search available models"
+            className="pl-8"
+          />
+        </div>
+
+        {providerStatus === "loading" || config === null ? (
+          <div className="rounded-lg border border-dashed border-border p-6 text-center text-sm text-muted-foreground">
+            Loading provider catalogs…
+          </div>
+        ) : (
+          <div className="grid overflow-hidden rounded-lg border border-border bg-card md:grid-cols-2 xl:grid-cols-3">
+            {providers.filter((provider) => provider.available).map((provider) => {
+              const catalog = catalogs[provider.id];
+              const models = (catalog?.models ?? []).filter((model) =>
+                `${model.displayName} ${model.model}`.toLocaleLowerCase().includes(query.toLocaleLowerCase()),
+              );
+              return (
+                <div key={provider.id} className="min-w-0 border-b border-r border-border last:border-r-0">
+                  <div className="flex items-center gap-2 border-b border-border bg-surface-recessed px-3 py-2.5 text-sm font-medium">
+                    <ModelMark provider={provider} className="size-4" />
+                    <span className="truncate">{provider.displayName}</span>
+                  </div>
+                  {catalog?.loading !== false ? (
+                    <p className="px-3 py-3 text-sm text-muted-foreground">Loading…</p>
+                  ) : catalog.error !== null ? (
+                    <p className="px-3 py-3 text-xs text-destructive">{catalog.error}</p>
+                  ) : models.length === 0 ? (
+                    <p className="px-3 py-3 text-sm text-muted-foreground">No matching models</p>
+                  ) : (
+                    models.map((model) => {
+                      const key = itemKey({ providerId: provider.id, model: model.model });
+                      const checked = selected.has(key);
+                      return (
+                        <button
+                          key={key}
+                          type="button"
+                          draggable
+                          onDragStart={(event) => {
+                            event.dataTransfer.setData(
+                              DRAG_TYPE,
+                              JSON.stringify({ providerId: provider.id, model: model.model }),
+                            );
+                            setDragging(true);
+                          }}
+                          onDragEnd={() => setDragging(false)}
+                          onClick={() =>
+                            checked
+                              ? commitItems(items.filter((item) => itemKey(item) !== key))
+                              : add(provider.id, model)
+                          }
+                          disabled={!checked && items.length >= MAX_LOADOUT}
+                          className="flex w-full items-center gap-2 border-b border-border px-3 py-2 text-left text-sm last:border-b-0 hover:bg-state-hover disabled:cursor-not-allowed disabled:opacity-40"
+                        >
+                          <span className="min-w-0 flex-1 truncate">{model.displayName}</span>
+                          {checked ? <Icon name="Check" className="size-4 shrink-0" aria-hidden /> : null}
+                          <Icon name="DragDropVertical" className="size-4 shrink-0 text-subtle-foreground" aria-hidden />
+                        </button>
+                      );
+                    })
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </section>
+    </div>
+  );
+}
+
+function mountNativeSelectorHider(generation: number) {
+  const style = document.createElement("style");
+  style.dataset.modelLoadoutStyle = String(generation);
+  style.textContent = `
+    [data-model-loadout-owner="${generation}"] > button[aria-label^="Provider, model and reasoning"],
+    [data-model-loadout-owner="${generation}"] button[aria-label^="Provider, model and reasoning"] {
+      display: none !important;
+    }
+    [data-model-loadout-popup-clip="${generation}"] {
+      overflow: visible !important;
+      position: relative;
+      z-index: 40;
+    }
+  `;
+  document.head.append(style);
+
+  let queued = false;
+  const refresh = () => {
+    queued = false;
+    observer.disconnect();
+    document
+      .querySelectorAll(`[data-model-loadout-owner="${generation}"]`)
+      .forEach((node) => node.removeAttribute("data-model-loadout-owner"));
+    document
+      .querySelectorAll(`[data-model-loadout-popup-clip="${generation}"]`)
+      .forEach((node) => node.removeAttribute("data-model-loadout-popup-clip"));
+    for (const trigger of Array.from(
+      document.querySelectorAll<HTMLElement>("[data-model-loadout-trigger]"),
+    )) {
+      let owner = trigger.parentElement;
+      while (owner !== null && owner !== document.body) {
+        const native = owner.querySelector<HTMLButtonElement>(
+          'button[aria-label^="Provider, model and reasoning"]',
+        );
+        if (native !== null && !native.hasAttribute("data-model-loadout-trigger")) {
+          owner.dataset.modelLoadoutOwner = String(generation);
+          break;
+        }
+        owner = owner.parentElement;
+      }
+    }
+    for (const popup of Array.from(
+      document.querySelectorAll<HTMLElement>("[data-model-loadout-popup]"),
+    )) {
+      let ancestor = popup.parentElement;
+      for (let depth = 0; ancestor !== null && ancestor !== document.body && depth < 10; depth += 1) {
+        const styles = getComputedStyle(ancestor);
+        if (styles.overflow === "hidden" || styles.overflowY === "hidden") {
+          ancestor.dataset.modelLoadoutPopupClip = String(generation);
+        }
+        ancestor = ancestor.parentElement;
+      }
+    }
+    observer.observe(document.body, { childList: true, subtree: true });
+  };
+  const observer = new MutationObserver(() => {
+    if (queued) return;
+    queued = true;
+    queueMicrotask(refresh);
+  });
+  refresh();
+  return () => {
+    observer.disconnect();
+    style.remove();
+    document
+      .querySelectorAll(`[data-model-loadout-owner="${generation}"]`)
+      .forEach((node) => node.removeAttribute("data-model-loadout-owner"));
+    document
+      .querySelectorAll(`[data-model-loadout-popup-clip="${generation}"]`)
+      .forEach((node) => node.removeAttribute("data-model-loadout-popup-clip"));
+  };
+}
+
+export default definePluginApp((app) => {
+  app.composer.customize({
+    id: "model-loadout-selector",
+    scopes: ["thread", "new-thread"],
+    actions: [{ id: "selector", component: SelectorAction }],
+    experimental_popups: [
+      {
+        id: "model-selector",
+        label: "Choose agent and model",
+        component: ModelSelectorPopup,
+      },
+    ],
+  });
+
+  app.slots.settingsSection({
+    id: "default-models",
+    component: DefaultModelsSettings,
+  });
+
+  app.contentScripts.register({
+    id: "hide-native-model-selector",
+    mount: ({ generation }) => mountNativeSelectorHider(generation),
+  });
+});
