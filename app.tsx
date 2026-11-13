@@ -395,19 +395,47 @@ function ModelSelectorPopup() {
 
   useLayoutEffect(() => {
     const popup = popupRef.current;
-    const frame = popup?.closest("[data-model-loadout-popup-clip]") ?? popup?.parentElement?.parentElement;
-    const trigger = popup?.closest("[data-promptbox]")?.querySelector("[data-model-loadout-trigger]");
-    if (popup == null || frame == null || trigger == null) return;
-    const align = () => {
-      const frameRect = frame.getBoundingClientRect();
-      const triggerRect = trigger.getBoundingClientRect();
-      const offset = triggerRect.right - frameRect.left - popup.offsetWidth;
-      popup.style.marginLeft = `${Math.max(0, Math.min(offset, frameRect.width - popup.offsetWidth))}px`;
+    const composerBox = popup?.closest("[data-promptbox]");
+    const trigger = composerBox?.querySelector<HTMLElement>("[data-model-loadout-trigger]");
+    if (popup == null || composerBox == null || trigger == null) return;
+    const GAP = 6;
+    const MARGIN = 8;
+    // Anchor the popup to the selector button, not to BB's composer-wide popup frame.
+    const place = () => {
+      const anchor = trigger.getBoundingClientRect();
+      const box = composerBox.getBoundingClientRect();
+      const width = popup.offsetWidth;
+      const height = popup.offsetHeight;
+      const alignRight = anchor.left + anchor.width / 2 > box.left + box.width / 2;
+      const left = Math.max(
+        MARGIN,
+        Math.min(alignRight ? anchor.right - width : anchor.left, window.innerWidth - width - MARGIN),
+      );
+      const above = anchor.top - GAP - height;
+      const top =
+        above >= MARGIN
+          ? above
+          : Math.max(MARGIN, Math.min(anchor.bottom + GAP, window.innerHeight - height - MARGIN));
+      popup.style.position = "fixed";
+      popup.style.zIndex = "60";
+      popup.style.left = `${left}px`;
+      popup.style.top = `${top}px`;
+      // A transformed ancestor shifts fixed elements; correct by the measured offset.
+      const actual = popup.getBoundingClientRect();
+      if (Math.abs(actual.left - left) > 0.5) popup.style.left = `${2 * left - actual.left}px`;
+      if (Math.abs(actual.top - top) > 0.5) popup.style.top = `${2 * top - actual.top}px`;
     };
-    align();
-    const observer = new ResizeObserver(align);
-    observer.observe(frame);
-    return () => observer.disconnect();
+    place();
+    const observer = new ResizeObserver(place);
+    observer.observe(popup);
+    observer.observe(composerBox);
+    window.addEventListener("resize", place);
+    window.addEventListener("scroll", place, true);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener("resize", place);
+      window.removeEventListener("scroll", place, true);
+    };
   }, []);
 
   const fastTier = currentModel?.supportedServiceTiers?.find((tier) => tier.id === "fast");
