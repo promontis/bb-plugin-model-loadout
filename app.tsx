@@ -1,9 +1,12 @@
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
+  useRef,
   useState,
   type DragEvent,
+  type KeyboardEvent,
 } from "react";
 import {
   definePluginApp,
@@ -54,6 +57,7 @@ function useLoadout() {
   const refresh = useCallback(() => {
     rpc.call("loadout_get").then(
       (next) => {
+        latestItems = next.items;
         setConfig(next);
         setError(null);
       },
@@ -69,6 +73,7 @@ function useLoadout() {
       setConfig(next);
       try {
         const saved = await rpc.call("loadout_save", next);
+        latestItems = saved.items;
         setConfig(saved);
         setError(null);
         return saved;
@@ -258,11 +263,68 @@ function SelectorAction() {
   );
 }
 
+const IS_MAC =
+  typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
+const SHORTCUT_LABELS = {
+  model: (n: number) => (IS_MAC ? `⌃⌘${n}` : `Ctrl+Alt+${n}`),
+  fast: IS_MAC ? "⌥F" : "Alt+F",
+  cycleEffort: IS_MAC ? "⌥T" : "Alt+T",
+};
+
+/** Latest loadout, so keyboard commands can run without a mounted popup. */
+let latestItems: readonly LoadoutItem[] = [];
+
+function Kbd({ children, boxed = false }: { children: string; boxed?: boolean }) {
+  return (
+    <kbd
+      className={cn(
+        "shrink-0 font-sans text-[12px] tracking-wide text-subtle-foreground",
+        boxed && "rounded-[5px] border border-border px-1.5 py-0.5 text-muted-foreground",
+      )}
+    >
+      {children}
+    </kbd>
+  );
+}
+
+function FastSwitch({ on, onToggle }: { on: boolean; onToggle(): void }) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      data-model-loadout-fast=""
+      aria-checked={on}
+      aria-label="Fast"
+      onClick={onToggle}
+      className={cn(
+        "relative h-[22px] w-[38px] shrink-0 rounded-full transition-colors",
+        on ? "bg-primary" : "bg-foreground/15",
+      )}
+    >
+      <span
+        className={cn(
+          "absolute left-[3px] top-[3px] size-4 rounded-full bg-foreground/90 shadow-sm transition-transform",
+          on ? "translate-x-4 bg-background" : "translate-x-0",
+        )}
+      />
+    </button>
+  );
+}
+
 function ModelSelectorPopup() {
   const composer = useComposer();
   const { config, error, save, providers, catalogs } = useModelLoadout();
   const [query, setQuery] = useState("");
   const [pending, setPending] = useState(false);
+  const [active, setActive] = useState(0);
+  const popupRef = useRef<HTMLDivElement>(null);
+  const [effortOpen, setEffortOpenState] = useState(false);
+  const [effortSide, setEffortSide] = useState<"right" | "left">("right");
+  const setEffortOpen = (next: boolean | ((open: boolean) => boolean)) => {
+    const rect = popupRef.current?.getBoundingClientRect();
+    if (rect !== undefined) setEffortSide(rect.right + 176 > window.innerWidth ? "left" : "right");
+    setEffortOpenState(next);
+  };
   const selection = composer.selection;
   const items = config?.items ?? [];
   const filtered = items.filter((item) => {
@@ -276,7 +338,18 @@ function ModelSelectorPopup() {
       item.providerId === selection?.providerId && item.model === selection?.model,
   );
   const currentModel =
-    currentItem === undefined ? undefined : findModel(currentItem, catalogs);
+    selection?.providerId === undefined || selection.model === undefined
+      ? undefined
+      : findModel({ providerId: selection.providerId, model: selection.model }, catalogs);
+
+  useEffect(() => {
+    const index = filtered.findIndex(
+      (item) => item.providerId === selection?.providerId && item.model === selection?.model,
+    );
+    setActive(index === -1 ? 0 : index);
+    // Only reset the highlight when the list itself changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [query, filtered.length]);
 
   const choose = async (item: LoadoutItem) => {
     if (pending) return;
@@ -295,8 +368,9 @@ function ModelSelectorPopup() {
   };
 
   const setEffort = async (reasoningLevel: LoadoutItem["reasoningLevel"]) => {
-    if (currentItem === undefined || config === null) return;
+    setEffortOpen(false);
     await composer.setSelection({ reasoningLevel });
+    if (currentItem === undefined || config === null) return;
     await save({
       ...config,
       items: config.items.map((item) =>
@@ -305,127 +379,206 @@ function ModelSelectorPopup() {
     });
   };
 
+  const onKeyDown = (event: KeyboardEvent) => {
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      if (filtered.length === 0) return;
+      const step = event.key === "ArrowDown" ? 1 : -1;
+      setActive((index) => (index + step + filtered.length) % filtered.length);
+    } else if (event.key === "Enter" && !event.nativeEvent.isComposing) {
+      const item = filtered[active];
+      if (item === undefined || findModel(item, catalogs) === undefined) return;
+      event.preventDefault();
+      void choose(item);
+    }
+  };
+
+  useLayoutEffect(() => {
+    const popup = popupRef.current;
+    const frame = popup?.closest("[data-model-loadout-popup-clip]") ?? popup?.parentElement?.parentElement;
+    const trigger = popup?.closest("[data-promptbox]")?.querySelector("[data-model-loadout-trigger]");
+    if (popup == null || frame == null || trigger == null) return;
+    const align = () => {
+      const frameRect = frame.getBoundingClientRect();
+      const triggerRect = trigger.getBoundingClientRect();
+      const offset = triggerRect.right - frameRect.left - popup.offsetWidth;
+      popup.style.marginLeft = `${Math.max(0, Math.min(offset, frameRect.width - popup.offsetWidth))}px`;
+    };
+    align();
+    const observer = new ResizeObserver(align);
+    observer.observe(frame);
+    return () => observer.disconnect();
+  }, []);
+
   const fastTier = currentModel?.supportedServiceTiers?.find((tier) => tier.id === "fast");
   const fast = selection?.serviceTier === "fast";
+  const efforts = currentModel?.supportedReasoningEfforts ?? [];
 
   return (
     <div
+      ref={popupRef}
       data-model-loadout-popup=""
-      className="w-[min(34rem,calc(100vw-1rem))] overflow-hidden rounded-xl border border-border bg-popover text-popover-foreground shadow-xl"
+      onKeyDown={onKeyDown}
+      className="w-[min(22rem,calc(100vw-1rem))] rounded-[14px] border border-border bg-popover p-1 text-popover-foreground shadow-xl"
     >
-      <div className="border-b border-border px-2 py-2">
-        <div className="relative">
-          <Icon name="Search" className="absolute left-2 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" aria-hidden />
+      <div
+        data-model-loadout-card=""
+        className="rounded-[10px] border border-border/70 bg-foreground/[0.035]"
+      >
+        <div className="relative flex h-10 items-center border-b border-border/70 px-3">
+          <Icon name="Search" className="size-4 shrink-0 text-subtle-foreground" aria-hidden />
           <Input
             autoFocus
             value={query}
             onChange={(event) => setQuery(event.target.value)}
             placeholder="Search models"
             aria-label="Search loadout models"
-            className="h-9 border-0 bg-transparent pl-8 shadow-none focus-visible:ring-0"
+            className="h-9 border-0 bg-transparent px-2.5 text-[14px] shadow-none placeholder:text-subtle-foreground focus-visible:ring-0"
           />
         </div>
-      </div>
 
-      <div className="max-h-[22rem] overflow-y-auto p-2">
-        {error !== null ? <p className="px-2 py-2 text-xs text-destructive">{error}</p> : null}
-        {config === null ? (
-          <p className="px-2 py-3 text-sm text-muted-foreground">Loading models…</p>
-        ) : filtered.length === 0 ? (
-          <p className="px-2 py-3 text-sm text-muted-foreground">
-            {items.length === 0 ? "Your model loadout is empty." : "No matching models."}
-          </p>
-        ) : (
-          filtered.map((item) => {
-            const model = findModel(item, catalogs);
-            const provider = findProvider(item.providerId, providers);
-            const selected =
-              selection?.providerId === item.providerId && selection.model === item.model;
-            return (
-              <button
-                key={itemKey(item)}
-                type="button"
-                disabled={pending || model === undefined}
-                onClick={() => void choose(item)}
-                className={cn(
-                  "flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left transition-colors",
-                  selected ? "bg-state-selected text-foreground" : "hover:bg-state-hover",
-                  model === undefined && "opacity-50",
-                )}
+        <div aria-label="Models" className="max-h-[18rem] overflow-y-auto p-1">
+          {error !== null ? <p className="px-2 py-2 text-xs text-destructive">{error}</p> : null}
+          {config === null ? (
+            <p className="px-2.5 py-2 text-[13px] text-muted-foreground">Loading models…</p>
+          ) : filtered.length === 0 ? (
+            <p className="px-2.5 py-2 text-[13px] text-muted-foreground">
+              {items.length === 0 ? "Your model loadout is empty." : "No matching models."}
+            </p>
+          ) : (
+            filtered.map((item, index) => {
+              const model = findModel(item, catalogs);
+              const provider = findProvider(item.providerId, providers);
+              const selected =
+                selection?.providerId === item.providerId && selection.model === item.model;
+              const otherAgent =
+                composer.scope.kind === "thread" &&
+                selection?.providerId !== undefined &&
+                selection.providerId !== item.providerId;
+              const slot = items.indexOf(item) + 1;
+              return (
+                <button
+                  key={itemKey(item)}
+                  type="button"
+                  aria-pressed={selected}
+                  disabled={pending || model === undefined}
+                  onClick={() => void choose(item)}
+                  onMouseMove={() => setActive(index)}
+                  title={otherAgent ? `Hand off to ${provider?.displayName ?? item.providerId}` : undefined}
+                  className={cn(
+                    "flex h-9 w-full items-center gap-2.5 rounded-lg px-2 text-left",
+                    index === active ? "bg-state-hover" : "",
+                    selected && "bg-state-selected",
+                    model === undefined && "opacity-50",
+                  )}
+                >
+                  <Icon name="DragDropVertical" className="size-3.5 shrink-0 text-subtle-foreground/70" aria-hidden />
+                  <ModelMark provider={provider} className="size-4 shrink-0" />
+                  <span className="flex min-w-0 flex-1 items-baseline gap-2">
+                    <span className="truncate text-[14px] text-foreground">
+                      {model?.displayName ?? item.model}
+                    </span>
+                    <span className="shrink-0 text-[13px] text-subtle-foreground">
+                      {displayEffort(item.reasoningLevel)}
+                    </span>
+                  </span>
+                  {selected ? (
+                    <Icon name="Check" className="size-4 shrink-0 text-foreground" aria-hidden />
+                  ) : otherAgent ? (
+                    <Icon name="ArrowUpRight" className="size-4 shrink-0 text-subtle-foreground" aria-hidden />
+                  ) : (
+                    <Kbd>{SHORTCUT_LABELS.model(slot)}</Kbd>
+                  )}
+                </button>
+              );
+            })
+          )}
+        </div>
+
+        {currentModel === undefined || (efforts.length === 0 && fastTier === undefined) ? null : (
+          <div className="border-t border-border/70 p-1">
+            {efforts.length === 0 ? null : (
+              <div
+                className="relative"
+                onMouseEnter={() => setEffortOpen(true)}
+                onMouseLeave={() => setEffortOpen(false)}
               >
-                <Icon name="DragDropVertical" className="size-4 shrink-0 text-subtle-foreground" aria-hidden />
-                <ModelMark provider={provider} className="size-5 shrink-0" />
-                <span className="min-w-0 flex-1 truncate text-sm font-medium">
-                  {model?.displayName ?? item.model}
-                </span>
-                <span className="shrink-0 text-sm text-muted-foreground">
-                  {displayEffort(item.reasoningLevel)}
-                </span>
-                {selected ? <Icon name="Check" className="size-4 shrink-0" aria-hidden /> : null}
-              </button>
-            );
-          })
+                <button
+                  type="button"
+                  aria-haspopup="menu"
+                  aria-expanded={effortOpen}
+                  onClick={() => setEffortOpen(true)}
+                  className={cn(
+                    "flex h-9 w-full items-center gap-2 rounded-lg px-2 text-left hover:bg-state-hover",
+                    effortOpen && "bg-state-hover",
+                  )}
+                >
+                  <span className="flex-1 text-[14px]">Effort</span>
+                  <span className="text-[13px] text-muted-foreground">
+                    {selection?.reasoningLevel === undefined
+                      ? "Default"
+                      : displayEffort(selection.reasoningLevel)}
+                  </span>
+                  <Icon name="ChevronRight" className="size-4 shrink-0 text-subtle-foreground" aria-hidden />
+                </button>
+                {effortOpen ? (
+                  <div
+                    className={cn(
+                      "absolute bottom-0 z-50",
+                      effortSide === "right" ? "left-full pl-2.5" : "right-full pr-2.5",
+                    )}
+                  >
+                    <div role="menu" aria-label="Effort" className="w-40 rounded-[10px] border border-border bg-popover p-1 shadow-xl">
+                      {efforts.map((effort) => {
+                        const checked = selection?.reasoningLevel === effort.reasoningEffort;
+                        return (
+                          <button
+                            key={effort.reasoningEffort}
+                            type="button"
+                            role="menuitemradio"
+                            aria-checked={checked}
+                            data-model-loadout-effort={effort.reasoningEffort}
+                            onClick={() => void setEffort(effort.reasoningEffort as ReasoningLevel)}
+                            className="flex h-8 w-full items-center gap-2 rounded-md px-2 text-left text-[13px] hover:bg-state-hover"
+                          >
+                            <span className="flex-1">{displayEffort(effort.reasoningEffort)}</span>
+                            {checked ? <Icon name="Check" className="size-3.5 shrink-0" aria-hidden /> : null}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                ) : null}
+              </div>
+            )}
+            {fastTier === undefined ? null : (
+              <div className="flex h-9 items-center gap-3 px-2">
+                <span className="flex-1 text-[14px]">Fast</span>
+                <Kbd>{SHORTCUT_LABELS.fast}</Kbd>
+                <FastSwitch
+                  on={fast}
+                  onToggle={() => void composer.setSelection({ serviceTier: fast ? "default" : "fast" })}
+                />
+              </div>
+            )}
+          </div>
         )}
       </div>
 
-      {currentModel === undefined ? null : (
-        <div className="space-y-2 border-t border-border px-3 py-2.5">
-          <div className="flex items-center gap-2">
-            <span className="flex-1 text-sm font-medium">Effort</span>
-            <div className="flex flex-wrap justify-end gap-1">
-              {currentModel.supportedReasoningEfforts.map((effort) => (
-                <button
-                  key={effort.reasoningEffort}
-                  type="button"
-                  data-model-loadout-effort={effort.reasoningEffort}
-                  onClick={() => void setEffort(effort.reasoningEffort as ReasoningLevel)}
-                  className={cn(
-                    "rounded-md px-2 py-1 text-xs transition-colors",
-                    selection?.reasoningLevel === effort.reasoningEffort
-                      ? "bg-state-selected text-foreground"
-                      : "text-muted-foreground hover:bg-state-hover hover:text-foreground",
-                  )}
-                >
-                  {displayEffort(effort.reasoningEffort)}
-                </button>
-              ))}
-            </div>
-          </div>
-          {fastTier === undefined ? null : (
-            <div className="flex items-center justify-between">
-              <span className="text-sm font-medium">Fast</span>
-              <button
-                type="button"
-                role="switch"
-                data-model-loadout-fast=""
-                aria-checked={fast}
-                onClick={() => void composer.setSelection({ serviceTier: fast ? "default" : "fast" })}
-                className={cn(
-                  "relative h-6 w-11 rounded-full transition-colors",
-                  fast ? "bg-primary" : "bg-muted",
-                )}
-              >
-                <span
-                  className={cn(
-                    "absolute top-1 size-4 rounded-full bg-background shadow-sm transition-transform",
-                    fast ? "translate-x-5" : "translate-x-1",
-                  )}
-                />
-              </button>
-            </div>
-          )}
-        </div>
-      )}
-
-      <div className="flex items-center justify-between border-t border-border px-3 py-2">
+      <div className="flex h-9 items-center justify-between px-2.5">
         <a
           href="/settings/plugins/model-loadout"
-          className="inline-flex items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground"
+          className="inline-flex items-center gap-1.5 text-[13px] text-muted-foreground hover:text-foreground"
         >
-          <Icon name="Settings" className="size-4" aria-hidden />
-          Edit loadout
+          <Icon name="Settings" className="size-3.5" aria-hidden />
+          Edit
         </a>
-        <span className="text-xs text-subtle-foreground">{items.length}/{MAX_LOADOUT} models</span>
+        {efforts.length === 0 ? null : (
+          <span className="inline-flex items-center gap-2 text-[13px] text-muted-foreground">
+            <Kbd boxed>{SHORTCUT_LABELS.cycleEffort}</Kbd>
+            Cycle effort
+          </span>
+        )}
       </div>
     </div>
   );
@@ -707,6 +860,11 @@ function mountNativeSelectorHider(generation: number) {
       position: relative;
       z-index: 40;
     }
+    [data-model-loadout-popup-clip="${generation}"]:has(> [data-bb-plugin-root] > [data-model-loadout-popup]) {
+      border-color: transparent !important;
+      background: transparent !important;
+      box-shadow: none !important;
+    }
   `;
   document.head.append(style);
 
@@ -779,6 +937,35 @@ export default definePluginApp((app) => {
         component: ModelSelectorPopup,
       },
     ],
+  });
+
+  for (let slot = 1; slot <= MAX_LOADOUT; slot += 1) {
+    app.composer.experimental_registerCommand({
+      id: `select-model-${slot}`,
+      title: `Model Loadout: select model ${slot}`,
+      defaultShortcut: { key: String(slot), mod: true, control: true },
+      run: async ({ composer }) => {
+        const item = latestItems[slot - 1];
+        if (item === undefined) return;
+        await composer.setSelection({
+          providerId: item.providerId,
+          model: item.model,
+          reasoningLevel: item.reasoningLevel,
+          ...(item.serviceTier === undefined ? {} : { serviceTier: item.serviceTier }),
+        });
+      },
+    });
+  }
+
+  app.composer.experimental_registerCommand({
+    id: "toggle-fast",
+    title: "Model Loadout: toggle fast mode",
+    defaultShortcut: { key: "f", alt: true },
+    run: async ({ composer }) => {
+      await composer.setSelection({
+        serviceTier: composer.selection?.serviceTier === "fast" ? "default" : "fast",
+      });
+    },
   });
 
   app.slots.settingsSection({
