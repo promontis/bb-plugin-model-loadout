@@ -5,6 +5,7 @@ import {
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
   type DragEvent,
   type KeyboardEvent,
 } from "react";
@@ -37,6 +38,36 @@ type Catalog = {
 type ReasoningLevel = LoadoutItem["reasoningLevel"];
 
 const MAX_LOADOUT = 5;
+/** A touch that moves further than this is a scroll, not a tap. */
+const TAP_SLOP_PX = 10;
+
+/**
+ * Composers whose model selector popup is open. The trigger reports it as
+ * aria-expanded, like BB's own selector: BB's compact (phone) composer keeps
+ * itself expanded while a trigger in it says its popup is open, and
+ * collapses otherwise, which takes the popup down with it.
+ */
+const openSelectorComposers = new Set<string>();
+const openSelectorListeners = new Set<() => void>();
+
+function setSelectorOpen(composerKey: string, open: boolean) {
+  if (open) openSelectorComposers.add(composerKey);
+  else openSelectorComposers.delete(composerKey);
+  for (const listener of openSelectorListeners) listener();
+}
+
+function subscribeSelectorOpen(listener: () => void) {
+  openSelectorListeners.add(listener);
+  return () => {
+    openSelectorListeners.delete(listener);
+  };
+}
+
+function useSelectorOpen(composerKey: string): boolean {
+  return useSyncExternalStore(subscribeSelectorOpen, () =>
+    openSelectorComposers.has(composerKey),
+  );
+}
 const DRAG_TYPE = "application/x-bb-model-loadout";
 const LOADOUT_CHANGED = "loadout-changed";
 
@@ -230,6 +261,16 @@ function ModelMark({ provider, className }: { provider: Provider | undefined; cl
 
 function SelectorAction() {
   const composer = useComposer();
+  const isOpen = useSelectorOpen(composer.key);
+  const touchStart = useRef<{ x: number; y: number } | null>(null);
+  // Report the popup open in the same render that mounts it, before focus
+  // moves into it: BB's phone composer checks the trigger then.
+  const openSelector = () => {
+    setSelectorOpen(composer.key, true);
+    if (!composer.experimental_openPopup("model-selector")) {
+      setSelectorOpen(composer.key, false);
+    }
+  };
   const selection = composer.selection;
   const { config, providers, catalogs } = useModelLoadout();
   if (selection?.providerId === undefined || selection.model === undefined) return null;
@@ -244,7 +285,27 @@ function SelectorAction() {
     <button
       type="button"
       data-model-loadout-trigger=""
-      onClick={() => composer.experimental_openPopup("model-selector")}
+      aria-haspopup="dialog"
+      aria-expanded={isOpen}
+      data-state={isOpen ? "open" : "closed"}
+      onTouchStart={(event) => {
+        const touch = event.touches[0];
+        touchStart.current = touch === undefined ? null : { x: touch.clientX, y: touch.clientY };
+      }}
+      onTouchEnd={(event) => {
+        // On iOS with the keyboard up, the emulated click moves focus out of
+        // the editor first; the keyboard closes, the composer drops, and the
+        // click lands where the button no longer is. Open on the tap itself
+        // and cancel the emulated click, so nothing moves under the finger.
+        const start = touchStart.current;
+        touchStart.current = null;
+        const touch = event.changedTouches[0];
+        if (start === null || touch === undefined) return;
+        if (Math.hypot(touch.clientX - start.x, touch.clientY - start.y) > TAP_SLOP_PX) return;
+        event.preventDefault();
+        openSelector();
+      }}
+      onClick={openSelector}
       className="flex h-7 max-w-56 items-center gap-1.5 rounded-md px-2 text-sm text-muted-foreground transition-colors hover:bg-state-hover hover:text-foreground"
       aria-label="Choose agent and model"
       title="Choose agent and model"
@@ -313,6 +374,10 @@ function FastSwitch({ on, onToggle }: { on: boolean; onToggle(): void }) {
 
 function ModelSelectorPopup() {
   const composer = useComposer();
+  useLayoutEffect(() => {
+    setSelectorOpen(composer.key, true);
+    return () => setSelectorOpen(composer.key, false);
+  }, [composer.key]);
   const { config, error, save, providers, catalogs } = useModelLoadout();
   const [query, setQuery] = useState("");
   const [pending, setPending] = useState(false);
