@@ -382,14 +382,7 @@ function ModelSelectorPopup() {
   const [query, setQuery] = useState("");
   const [pending, setPending] = useState(false);
   const [active, setActive] = useState(0);
-  const popupRef = useRef<HTMLDivElement>(null);
-  const [effortOpen, setEffortOpenState] = useState(false);
-  const [effortSide, setEffortSide] = useState<"right" | "left">("right");
-  const setEffortOpen = (next: boolean | ((open: boolean) => boolean)) => {
-    const rect = popupRef.current?.getBoundingClientRect();
-    if (rect !== undefined) setEffortSide(rect.right + 176 > window.innerWidth ? "left" : "right");
-    setEffortOpenState(next);
-  };
+  const [effortOpen, setEffortOpen] = useState(false);
   const selection = composer.selection;
   const items = config?.items ?? [];
   const filtered = items.filter((item) => {
@@ -458,61 +451,15 @@ function ModelSelectorPopup() {
     }
   };
 
-  useLayoutEffect(() => {
-    const popup = popupRef.current;
-    const composerBox = popup?.closest("[data-promptbox]");
-    const trigger = composerBox?.querySelector<HTMLElement>("[data-model-loadout-trigger]");
-    if (popup == null || composerBox == null || trigger == null) return;
-    const GAP = 6;
-    const MARGIN = 8;
-    // Anchor the popup to the selector button, not to BB's composer-wide popup frame.
-    const place = () => {
-      const anchor = trigger.getBoundingClientRect();
-      const box = composerBox.getBoundingClientRect();
-      const width = popup.offsetWidth;
-      const height = popup.offsetHeight;
-      const alignRight = anchor.left + anchor.width / 2 > box.left + box.width / 2;
-      const left = Math.max(
-        MARGIN,
-        Math.min(alignRight ? anchor.right - width : anchor.left, window.innerWidth - width - MARGIN),
-      );
-      const above = anchor.top - GAP - height;
-      const top =
-        above >= MARGIN
-          ? above
-          : Math.max(MARGIN, Math.min(anchor.bottom + GAP, window.innerHeight - height - MARGIN));
-      popup.style.position = "fixed";
-      popup.style.zIndex = "60";
-      popup.style.left = `${left}px`;
-      popup.style.top = `${top}px`;
-      // A transformed ancestor shifts fixed elements; correct by the measured offset.
-      const actual = popup.getBoundingClientRect();
-      if (Math.abs(actual.left - left) > 0.5) popup.style.left = `${2 * left - actual.left}px`;
-      if (Math.abs(actual.top - top) > 0.5) popup.style.top = `${2 * top - actual.top}px`;
-    };
-    place();
-    const observer = new ResizeObserver(place);
-    observer.observe(popup);
-    observer.observe(composerBox);
-    window.addEventListener("resize", place);
-    window.addEventListener("scroll", place, true);
-    return () => {
-      observer.disconnect();
-      window.removeEventListener("resize", place);
-      window.removeEventListener("scroll", place, true);
-    };
-  }, []);
-
   const fastTier = currentModel?.supportedServiceTiers?.find((tier) => tier.id === "fast");
   const fast = selection?.serviceTier === "fast";
   const efforts = currentModel?.supportedReasoningEfforts ?? [];
 
   return (
     <div
-      ref={popupRef}
       data-model-loadout-popup=""
       onKeyDown={onKeyDown}
-      className="w-[min(22rem,calc(100vw-1rem))] rounded-[14px] border border-border bg-popover p-1 text-popover-foreground shadow-xl"
+      className="w-full p-1 text-popover-foreground"
     >
       <div
         data-model-loadout-card=""
@@ -615,12 +562,7 @@ function ModelSelectorPopup() {
                   <Icon name="ChevronRight" className="size-4 shrink-0 text-subtle-foreground" aria-hidden />
                 </button>
                 {effortOpen ? (
-                  <div
-                    className={cn(
-                      "absolute bottom-0 z-50",
-                      effortSide === "right" ? "left-full pl-2.5" : "right-full pr-2.5",
-                    )}
-                  >
+                  <div className="absolute bottom-0 right-0 z-50">
                     <div role="menu" aria-label="Effort" className="w-40 rounded-[10px] border border-border bg-popover p-1 shadow-xl">
                       {efforts.map((effort) => {
                         const checked = selection?.reasoningLevel === effort.reasoningEffort;
@@ -944,78 +886,13 @@ function mountNativeSelectorHider(generation: number) {
   const style = document.createElement("style");
   style.dataset.modelLoadoutStyle = String(generation);
   style.textContent = `
-    [data-model-loadout-owner="${generation}"] > button[aria-label^="Provider, model and reasoning"],
-    [data-model-loadout-owner="${generation}"] button[aria-label^="Provider, model and reasoning"] {
+    [data-promptbox]:has([data-model-loadout-trigger])
+      button[aria-label^="Provider, model and reasoning"]:not([data-model-loadout-trigger]) {
       display: none !important;
-    }
-    [data-model-loadout-popup-clip="${generation}"] {
-      overflow: visible !important;
-      position: relative;
-      z-index: 40;
-    }
-    [data-model-loadout-popup-clip="${generation}"]:has(> [data-bb-plugin-root] > [data-model-loadout-popup]) {
-      border-color: transparent !important;
-      background: transparent !important;
-      box-shadow: none !important;
     }
   `;
   document.head.append(style);
-
-  let queued = false;
-  const refresh = () => {
-    queued = false;
-    observer.disconnect();
-    document
-      .querySelectorAll(`[data-model-loadout-owner="${generation}"]`)
-      .forEach((node) => node.removeAttribute("data-model-loadout-owner"));
-    document
-      .querySelectorAll(`[data-model-loadout-popup-clip="${generation}"]`)
-      .forEach((node) => node.removeAttribute("data-model-loadout-popup-clip"));
-    for (const trigger of Array.from(
-      document.querySelectorAll<HTMLElement>("[data-model-loadout-trigger]"),
-    )) {
-      let owner = trigger.parentElement;
-      while (owner !== null && owner !== document.body) {
-        const native = owner.querySelector<HTMLButtonElement>(
-          'button[aria-label^="Provider, model and reasoning"]',
-        );
-        if (native !== null && !native.hasAttribute("data-model-loadout-trigger")) {
-          owner.dataset.modelLoadoutOwner = String(generation);
-          break;
-        }
-        owner = owner.parentElement;
-      }
-    }
-    for (const popup of Array.from(
-      document.querySelectorAll<HTMLElement>("[data-model-loadout-popup]"),
-    )) {
-      let ancestor = popup.parentElement;
-      for (let depth = 0; ancestor !== null && ancestor !== document.body && depth < 10; depth += 1) {
-        const styles = getComputedStyle(ancestor);
-        if (styles.overflow === "hidden" || styles.overflowY === "hidden") {
-          ancestor.dataset.modelLoadoutPopupClip = String(generation);
-        }
-        ancestor = ancestor.parentElement;
-      }
-    }
-    observer.observe(document.body, { childList: true, subtree: true });
-  };
-  const observer = new MutationObserver(() => {
-    if (queued) return;
-    queued = true;
-    queueMicrotask(refresh);
-  });
-  refresh();
-  return () => {
-    observer.disconnect();
-    style.remove();
-    document
-      .querySelectorAll(`[data-model-loadout-owner="${generation}"]`)
-      .forEach((node) => node.removeAttribute("data-model-loadout-owner"));
-    document
-      .querySelectorAll(`[data-model-loadout-popup-clip="${generation}"]`)
-      .forEach((node) => node.removeAttribute("data-model-loadout-popup-clip"));
-  };
+  return () => style.remove();
 }
 
 export default definePluginApp((app) => {
